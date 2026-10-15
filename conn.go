@@ -1048,6 +1048,20 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 		outBufPool.Put(outBufPtr)
 	}()
 
+	// The records of one call go out in a single write: one write per record
+	// cost a syscall per 16 KiB, and more at the start of a connection, where
+	// dynamic record sizing keeps records small (miray T-031).
+	// A single record is written as before; the batch starts with the first
+	// record that has more data after it.
+	var batch []byte
+	var batchPtr *[]byte
+	defer func() {
+		if batchPtr != nil {
+			*batchPtr = batch
+			outBufPool.Put(batchPtr)
+		}
+	}()
+
 	var n int
 	for len(data) > 0 {
 		m := len(data)
@@ -1077,11 +1091,23 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 		if err != nil {
 			return n, err
 		}
-		if _, err := c.write(outBuf); err != nil {
+		if batchPtr == nil && !c.buffering && len(data) > m {
+			batchPtr = outBufPool.Get().(*[]byte)
+			batch = (*batchPtr)[:0]
+		}
+		if batchPtr != nil {
+			batch = append(batch, outBuf...)
+			c.bytesSent += int64(len(outBuf)) // as c.write does; record sizing depends on it
+		} else if _, err := c.write(outBuf); err != nil {
 			return n, err
 		}
 		n += m
 		data = data[m:]
+	}
+	if batchPtr != nil {
+		if _, err := c.conn.Write(batch); err != nil {
+			return 0, err
+		}
 	}
 
 	if typ == recordTypeChangeCipherSpec && c.vers != VersionTLS13 {
